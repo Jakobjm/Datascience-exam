@@ -175,3 +175,5 @@ cython_debug/
 
 # data files
 data/
+code/masks
+code/patches
