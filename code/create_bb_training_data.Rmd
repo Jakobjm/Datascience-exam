@@ -1,0 +1,197 @@
+---
+title: "Create-mounds-training-data"
+author: "Jakob Mørup"
+date: "2025-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Installing and loading packages
+```{r}
+#install.packages("pacman")
+pacman::p_load(terra, tidyverse, sf, measurements, stringr, raster,purrr)
+
+
+```
+
+loading the KAZ_moundattributes and VisibleID to pick out the visible mounds to create bounding boxes for training the U-Net model later.
+```{r}
+Mounds <- read.csv("../data/KAZ_moundattributes.csv") #Read in mound attributes
+
+visibleID <- read.delim("../data/visibleID.txt") 
+colnames(visibleID) <- "TRAP_ID"   #Read in list of visible mounds and change column name to match the one in mounds
+
+
+visibleMounds <- inner_join(Mounds,visibleID) %>% mutate(
+                                                  max_dim = pmax(Length, Width),
+                                                  size_bucket = case_when(
+                                                  max_dim <= 10 ~ "small",
+                                                  max_dim <= 40 ~ "medium",
+                                                  TRUE ~ "large"
+                                                  )
+                                                  )  #inner join to only pick the ones in the visible list, then find the maximum dimension for each, and bucket                                                        them according to that.
+
+
+```
+
+
+for each mounds I now make a bounding box of different dimensions for each size bucket. 
+this is to make sure the background doesn't completely drown the signal in noise for the small and medium mounds.
+these will be used to fine tune different heads on a U-Net segmentation model (together with patches of similar sizes without mounds in them)
+
+
+
+generate bounding boxes.
+```{r}
+#####################################
+# SETTING THE BUFFER SIZES, THESE CONTROL THE SIZE OF THE BOUNDING BOXES FOR SMALL/MEDUIM/LARGE MOUNDS
+#####################################
+buffer_sizes <- c(6,24,78) #these are set at 20% bigger than the threshold and for large mounds 20% bigger than 130 which is the max dimension of the largest mound
+#this makes the mounds (assuming they are circular) fill at max ~71% of the area and the minimum would be ~21% for a mound that just makes the large category.
+#the idea is that having some background around the mound is good for training the segmentation model, but if the mound is only a tiny part of the image, it will learn
+#background noise instead. 
+#thresholds are x<=10,x<=40,40<=x, where x is the largest dimension of the mound, for small/medium and large respectively.
+```
+Trying a modified version of Adelas approach
+
+```{r}
+mounds2 <- st_read("../data/KAZ_mounds.shp")
+# filter the noticeable ones (2+ meters)
+mounds2 <- mounds2 %>% 
+  left_join(Mounds, by = c("TRAP_Code"="TRAP_ID"))
+
+
+visibleMounds2 <- inner_join(mounds2,visibleID, by = c("TRAP_Code"="TRAP_ID")) %>% mutate(
+                                                  max_dim = pmax(Length, Width),
+                                                  size_bucket = case_when(
+                                                  max_dim <= 10 ~ "small",
+                                                  max_dim <= 40 ~ "medium",
+                                                  TRUE ~ "large"
+                                                  )
+                                                  )  #inner join to only pick the ones in the visible list, then find the maximum dimension for each, and bucket                                                        them according to that.
+
+#add buffer sizes as col
+visibleMounds2 <- visibleMounds2 %>%
+  mutate(buffer = case_when(
+    size_bucket == "small" ~ buffer_sizes[1],
+    size_bucket == "medium" ~ buffer_sizes[2],
+    size_bucket == "large" ~ buffer_sizes[3]
+  ))
+
+
+#pulling out center coordinates for creating label masks, together with max_dim
+center_coords <- st_coordinates(visibleMounds2)
+colnames(center_coords) <- c("center_x","center_y")
+visibleMounds2 <- cbind(visibleMounds2, center_coords)
+
+```
+```{r}
+morevisibleMounds2 <- mounds2 %>% mutate(
+                                                  max_dim = pmax(Length, Width),
+                                                  size_bucket = case_when(
+                                                  max_dim <= 10 ~ "small",
+                                                  max_dim <= 40 ~ "medium",
+                                                  TRUE ~ "large"
+                                                  )
+                                                  )  #inner join to only pick the ones in the visible list, then find the maximum dimension for each, and bucket                                                        them according to that.
+
+#add buffer sizes as col
+morevisibleMounds2 <- morevisibleMounds2 %>%
+  mutate(buffer = case_when(
+    size_bucket == "small" ~ buffer_sizes[1],
+    size_bucket == "medium" ~ buffer_sizes[2],
+    size_bucket == "large" ~ buffer_sizes[3]
+  ))
+
+
+#pulling out center coordinates for creating label masks, together with max_dim
+center_coords <- st_coordinates(morevisibleMounds2)
+colnames(center_coords) <- c("center_x","center_y")
+morevisibleMounds2 <- cbind(morevisibleMounds2, center_coords)
+
+```
+
+```{r}
+
+#create empty list to hold bounding box polygons
+polylist <- list()
+polylist2 <- list()
+
+
+#function to take in a point and create a square polygon based on buffer size, centered on this point
+make_square_bbox <- function(pt, size) {
+  coords <- st_coordinates(pt)
+  x <- coords[1]
+  y <- coords[2]
+  box <- matrix(c(
+    x - size, y - size,
+    x + size, y - size,
+    x + size, y + size,
+    x - size, y + size,
+    x - size, y - size
+  ), ncol = 2, byrow = TRUE)
+  return(st_polygon(list(box))) 
+}
+
+
+#looping over each point and adding the resulting polygon from above function to the list
+for (i in 1:248) {
+  a <- visibleMounds2[i,]$geometry
+  b <- visibleMounds2[i,]$buffer
+  polylist[i] <- make_square_bbox(a,b)
+}
+
+for (i in 1:773) {
+  a <- morevisibleMounds2[i,]$geometry
+  b <- morevisibleMounds2[i,]$buffer
+  polylist2[i] <- make_square_bbox(a,b)
+}
+
+#turning the list of matrices into a Simple Feature Column (sfc) 
+sfc_polygons <- st_sfc(lapply(polylist, function(mat) st_polygon(list(mat))))
+sfc_polygons2 <- st_sfc(lapply(polylist2, function(mat) st_polygon(list(mat))))
+
+
+#binding this new sfc to my dataset
+visibleMounds3 <- cbind(visibleMounds2, sfc_polygons)
+morevisibleMounds3 <- cbind(morevisibleMounds2, sfc_polygons2)
+
+
+# Convert it back to an sf object in case something broke along the way
+visibleMounds3 <- st_as_sf(visibleMounds3)
+morevisibleMounds3 <- st_as_sf(morevisibleMounds3)
+
+# Explicitly set the active geometry column to the new polygon column
+st_geometry(visibleMounds3) <- "geometry.1"
+st_geometry(morevisibleMounds3) <- "geometry.1"
+
+# Check if everything is correctly structured
+print(st_geometry_type(visibleMounds3))
+print(st_geometry_type(morevisibleMounds3))
+
+#remove the POINT geometry, and rename the POLYGON geometry to "geometry"
+visibleMounds4 <- visibleMounds3 %>% 
+  dplyr::select(-geometry) %>% 
+  rename(geometry = geometry.1) %>% 
+  st_as_sf()
+
+morevisibleMounds4 <- morevisibleMounds3 %>% 
+  dplyr::select(-geometry) %>% 
+  rename(geometry = geometry.1) %>% 
+  st_as_sf()
+
+#apply the right crs
+st_crs(visibleMounds4) <- st_crs(visibleMounds2)
+st_crs(morevisibleMounds4) <- st_crs(morevisibleMounds2)
+
+
+#write to a file
+st_write(visibleMounds4, "bounding_boxes.geojson", delete_dsn = TRUE)
+st_write(morevisibleMounds4, "more_bounding_boxes.geojson", delete_dsn = TRUE)
+
+
+```
+
