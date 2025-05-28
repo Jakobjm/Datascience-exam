@@ -177,3 +177,7 @@ cython_debug/
 data/
 code/masks
 code/patches
+code/more_masks
+code/more_patches
+code/predictions
+code/more_predictions
